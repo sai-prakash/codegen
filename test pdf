@@ -1,0 +1,350 @@
+import React, { useState, useRef, useEffect } from 'react';
+import { Check, X, Plus, Eye, Download, RotateCcw, Upload, Search, FileText, ZoomIn, ZoomOut, ChevronLeft, ChevronRight } from 'lucide-react';
+
+const DocumentValidator = () => {
+  const [selectedField, setSelectedField] = useState(null);
+  const [customFields, setCustomFields] = useState([]);
+  const [newFieldName, setNewFieldName] = useState('');
+  const [isAddingField, setIsAddingField] = useState(false);
+  const [uploadedFile, setUploadedFile] = useState(null);
+  const [pdfDoc, setPdfDoc] = useState(null);
+  const [pdfPage, setPdfPage] = useState(null);
+  const [searchTerm, setSearchTerm] = useState('');
+  const [searchResults, setSearchResults] = useState([]);
+  const [currentSearchIndex, setCurrentSearchIndex] = useState(-1);
+  const [zoom, setZoom] = useState(1.5);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [totalPages, setTotalPages] = useState(0);
+  const [textContent, setTextContent] = useState(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const fileInputRef = useRef(null);
+  const canvasRef = useRef(null);
+  const searchLayerRef = useRef(null);
+  const renderTaskRef = useRef(null);
+
+  const [extractedFields, setExtractedFields] = useState([
+    { id: 1, name: 'Full Name', value: 'John Michael Anderson', confidence: 95, verified: false },
+    { id: 2, name: 'Date of Birth', value: '03/15/1985', confidence: 88, verified: true },
+    { id: 3, name: 'Address', value: '1234 Oak Street, Springfield, IL 62704', confidence: 92, verified: false },
+    { id: 4, name: 'Phone Number', value: '(555) 123-4567', confidence: 85, verified: false },
+    { id: 5, name: 'Email', value: 'john.anderson@email.com', confidence: 90, verified: true },
+    { id: 6, name: 'Document ID', value: 'DOC-2025-001234', confidence: 98, verified: false },
+  ]);
+
+  // Load PDF.js library when the component mounts
+  useEffect(() => {
+    const loadPdfJs = async () => {
+      if (!window.pdfjsLib) {
+        const script = document.createElement('script');
+        script.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js';
+        
+        return new Promise((resolve) => {
+          script.onload = () => {
+            window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+            resolve();
+          };
+          document.head.appendChild(script);
+        });
+      }
+    };
+    
+    loadPdfJs();
+  }, []);
+
+  // Handles the PDF file upload
+  const handleFileUpload = async (event) => {
+    const file = event.target.files[0];
+    if (file && file.type === 'application/pdf') {
+      setIsLoading(true);
+      setUploadedFile({ name: file.name, size: file.size, uploadTime: new Date().toLocaleString() });
+      setSearchTerm('');
+      setSearchResults([]);
+      setCurrentSearchIndex(-1);
+
+      try {
+        const arrayBuffer = await file.arrayBuffer();
+        while (!window.pdfjsLib) {
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+        const pdf = await window.pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+        setPdfDoc(pdf);
+        setTotalPages(pdf.numPages);
+        await goToPage(1, pdf);
+      } catch (error) {
+        console.error('Error loading PDF:', error);
+      } finally {
+        setIsLoading(false);
+      }
+    }
+  };
+
+  // Renders a given PDF page onto the canvas
+  const renderPage = async (page) => {
+    if (!page || !canvasRef.current) return;
+    
+    if (renderTaskRef.current) {
+        renderTaskRef.current.cancel();
+    }
+    
+    const viewport = page.getViewport({ scale: zoom });
+    const canvas = canvasRef.current;
+    const context = canvas.getContext('2d');
+    
+    canvas.height = viewport.height;
+    canvas.width = viewport.width;
+    
+    if (searchLayerRef.current) {
+      searchLayerRef.current.style.width = `${viewport.width}px`;
+      searchLayerRef.current.style.height = `${viewport.height}px`;
+    }
+    
+    const renderContext = { canvasContext: context, viewport: viewport };
+    
+    const renderTask = page.render(renderContext);
+    renderTaskRef.current = renderTask;
+
+    try {
+        await renderTask.promise;
+        renderTaskRef.current = null;
+    } catch(error) {
+        if (error.name !== 'RenderingCancelledException') {
+            console.error("PDF render error:", error);
+        }
+    }
+  };
+
+  // Searches for a term within the current page's text content
+  const handleSearch = (term) => {
+    setSearchTerm(term);
+
+    if (!term.trim() || !textContent) {
+      setSearchResults([]);
+      setCurrentSearchIndex(-1);
+      return;
+    }
+
+    const matches = [];
+    const escapedTerm = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const searchRegex = new RegExp(escapedTerm, 'gi');
+
+    textContent.items.forEach((item) => {
+      let match;
+      while ((match = searchRegex.exec(item.str)) !== null) {
+        matches.push({ textItem: item, matchStart: match.index, matchEnd: match.index + match[0].length });
+      }
+    });
+
+    setSearchResults(matches);
+    setCurrentSearchIndex(matches.length > 0 ? 0 : -1);
+  };
+
+  // Removes all highlight elements from the search layer
+  const clearHighlights = () => {
+    if (searchLayerRef.current) {
+      searchLayerRef.current.innerHTML = '';
+    }
+  };
+
+  const highlightSearchResults = () => {
+    if (!searchLayerRef.current || !pdfPage || !canvasRef.current || !textContent) return;
+    
+    clearHighlights();
+    
+    if (searchResults.length === 0) return;
+
+    const viewport = pdfPage.getViewport({ scale: zoom });
+    const searchLayer = searchLayerRef.current;
+    
+    searchResults.forEach((match, index) => {
+      const { textItem, matchStart, matchEnd } = match;
+      if (textItem.str.length === 0) return;
+
+      const rect = viewport.convertToViewportRectangle([
+        textItem.transform[4],
+        textItem.transform[5],
+        textItem.transform[4] + textItem.width,
+        textItem.transform[5] + textItem.height
+      ]);
+      const [x1, y1, x2, y2] = rect;
+      
+      // ***** ACCURACY FIX: Use character count proportions for precision *****
+      // This calculates the highlight's position based on its location within the string,
+      // relative to the known width of the text block from PDF.js. This avoids
+      // font measurement mismatches that cause inaccuracy.
+      const totalWidthOnCanvas = x2 - x1;
+      const startOffset = (matchStart / textItem.str.length) * totalWidthOnCanvas;
+      const highlightWidth = ((matchEnd - matchStart) / textItem.str.length) * totalWidthOnCanvas;
+
+      const highlight = document.createElement('div');
+      highlight.style.position = 'absolute';
+      highlight.style.left = `${x1 + startOffset}px`;
+      highlight.style.top = `${canvasRef.current.height - y2}px`;
+      highlight.style.width = `${highlightWidth}px`;
+      highlight.style.height = `${y2 - y1}px`;
+      highlight.style.pointerEvents = 'none';
+
+      if (index === currentSearchIndex) {
+        highlight.style.backgroundColor = 'rgba(251, 191, 36, 0.5)'; // yellow-400
+        highlight.style.border = '1.5px solid #f59e0b'; // amber-500
+      } else {
+        highlight.style.backgroundColor = 'rgba(252, 211, 77, 0.4)'; // yellow-300
+      }
+      
+      searchLayer.appendChild(highlight);
+    });
+  };
+
+  // Navigates between search results
+  const navigateSearch = (direction) => {
+    if (searchResults.length === 0) return;
+    const newIndex = direction === 'next'
+      ? (currentSearchIndex + 1) % searchResults.length
+      : (currentSearchIndex - 1 + searchResults.length) % searchResults.length;
+    setCurrentSearchIndex(newIndex);
+  };
+  
+  // Navigates to a specific page number
+  const goToPage = async (pageNum, doc = pdfDoc) => {
+      if (!doc || pageNum < 1 || pageNum > doc.numPages) return;
+      setIsLoading(true);
+      setCurrentPage(pageNum);
+      const page = await doc.getPage(pageNum);
+      setPdfPage(page);
+      const newTextContent = await page.getTextContent();
+      setTextContent(newTextContent);
+      await renderPage(page);
+      handleSearch(searchTerm); // Re-run search on new page
+      setIsLoading(false);
+  };
+
+  // Re-render the canvas when page or zoom changes
+  useEffect(() => {
+    if (pdfPage) renderPage(pdfPage);
+  }, [zoom, pdfPage]);
+
+  // Re-run highlighting when results, index, or view changes
+  useEffect(() => {
+    highlightSearchResults();
+  }, [searchResults, currentSearchIndex, zoom, pdfPage]);
+
+  const handleVerifyField = (fieldId, isVerified) => setExtractedFields(fields => fields.map(f => f.id === fieldId ? { ...f, verified: isVerified } : f));
+  const handleFieldValueChange = (fieldId, value) => setExtractedFields(fields => fields.map(f => f.id === fieldId ? { ...f, value, verified: false } : f));
+
+  const addCustomField = () => {
+    if (newFieldName.trim()) {
+      const newField = { id: Date.now(), name: newFieldName, value: '', confidence: 0, verified: false, isCustom: true };
+      setExtractedFields(fields => [...fields, newField]);
+      setCustomFields(prev => [...prev, newField]);
+      setNewFieldName('');
+      setIsAddingField(false);
+    }
+  };
+
+  const getConfidenceColor = (confidence) => {
+    if (confidence >= 90) return 'text-green-600';
+    if (confidence >= 75) return 'text-yellow-600';
+    return 'text-red-600';
+  };
+
+  const verifiedCount = extractedFields.filter(field => field.verified).length;
+  const totalFields = extractedFields.length;
+
+  return (
+    <div className="h-screen bg-gray-100 flex flex-col font-sans">
+      <div className="bg-white border-b border-gray-200 p-4 shadow-sm">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center space-x-4">
+            <h1 className="text-2xl font-bold text-gray-800">Document Validator</h1>
+            {uploadedFile && (<div className="flex items-center space-x-2 bg-green-100 text-green-800 px-3 py-1 rounded-full text-sm font-medium"><div className="w-2.5 h-2.5 bg-green-500 rounded-full"></div><span>Loaded</span></div>)}
+            {!uploadedFile && (<div className="flex items-center space-x-2 bg-gray-200 text-gray-700 px-3 py-1 rounded-full text-sm font-medium"><div className="w-2.5 h-2.5 bg-gray-400 rounded-full"></div><span>No Document</span></div>)}
+            {isLoading && (<div className="flex items-center space-x-2 text-blue-800 px-3 py-1 rounded-full text-sm font-medium"><div className="animate-spin rounded-full h-4 w-4 border-b-2 border-blue-600"></div><span>Processing...</span></div>)}
+          </div>
+          <div className="flex items-center space-x-3"><span className="text-sm font-medium text-gray-600">{verifiedCount} / {totalFields} Verified</span><div className="w-32 bg-gray-200 rounded-full h-2.5"><div className="bg-green-500 h-2.5 rounded-full transition-all duration-500 ease-out" style={{ width: totalFields > 0 ? `${(verifiedCount / totalFields) * 100}%` : '0%' }}></div></div></div>
+        </div>
+      </div>
+
+      <div className="flex flex-1 overflow-hidden">
+        <div className="w-1/2 bg-gray-200 flex flex-col">
+          <div className="p-3 bg-white border-b border-gray-200">
+             {pdfDoc && (
+              <div className="flex items-center justify-between">
+                <div className="flex-1 relative mr-4">
+                  <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 w-5 h-5" />
+                  <input type="text" placeholder="Search in document..." value={searchTerm} onChange={(e) => handleSearch(e.target.value)} className="w-full pl-10 pr-24 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                  {searchResults.length > 0 && (<div className="absolute right-2 top-1/2 transform -translate-y-1/2 flex items-center space-x-1"><span className="text-sm text-gray-500">{currentSearchIndex + 1} of {searchResults.length}</span><button onClick={() => navigateSearch('prev')} className="p-1 text-gray-600 hover:bg-gray-200 rounded-full"><ChevronLeft className="w-4 h-4" /></button><button onClick={() => navigateSearch('next')} className="p-1 text-gray-600 hover:bg-gray-200 rounded-full"><ChevronRight className="w-4 h-4" /></button></div>)}
+                </div>
+                <div className="flex items-center space-x-1"><button onClick={() => setZoom(z => Math.max(0.5, z - 0.25))} className="p-2 text-gray-600 hover:bg-gray-200 rounded-full" title="Zoom Out"><ZoomOut className="w-5 h-5" /></button><span className="text-sm text-gray-700 font-medium w-16 text-center">{Math.round(zoom * 100)}%</span><button onClick={() => setZoom(z => Math.min(3, z + 0.25))} className="p-2 text-gray-600 hover:bg-gray-200 rounded-full" title="Zoom In"><ZoomIn className="w-5 h-5" /></button></div>
+              </div>
+            )}
+          </div>
+          <div className="flex-1 overflow-auto p-4 flex justify-center items-start">
+            {!uploadedFile ? (<div className="h-full flex items-center justify-center"><div className="text-center p-12 border-2 border-dashed border-gray-300 rounded-xl hover:border-blue-500 hover:bg-white transition-all cursor-pointer" onClick={() => fileInputRef.current?.click()} onDragOver={(e) => e.preventDefault()} onDrop={(e) => { e.preventDefault(); handleFileUpload({ target: { files: e.dataTransfer.files } });}}><Upload className="w-12 h-12 text-gray-400 mx-auto mb-4" /><h3 className="text-lg font-semibold text-gray-800">Upload PDF Document</h3><p className="text-gray-500 mt-1">Drag & drop or click to browse</p></div><input ref={fileInputRef} type="file" accept=".pdf" onChange={handleFileUpload} className="hidden" /></div>) 
+            : (<div className="bg-white shadow-lg rounded-lg mx-auto max-w-max relative"><canvas ref={canvasRef} /><div ref={searchLayerRef} className="absolute top-0 left-0" /></div>)}
+          </div>
+          {pdfDoc && totalPages > 1 && (<div className="p-2 bg-white border-t border-gray-200 flex items-center justify-center space-x-4"><button onClick={() => goToPage(currentPage - 1)} disabled={currentPage === 1} className="px-4 py-2 bg-gray-200 text-gray-800 rounded-lg hover:bg-gray-300 disabled:opacity-50 flex items-center"><ChevronLeft className="w-5 h-5 mr-1" /> Prev</button><span className="text-sm font-medium text-gray-700">Page {currentPage} of {totalPages}</span><button onClick={() => goToPage(currentPage + 1)} disabled={currentPage === totalPages} className="px-4 py-2 bg-gray-200 text-gray-800 rounded-lg hover:bg-gray-300 disabled:opacity-50 flex items-center">Next <ChevronRight className="w-5 h-5 ml-1" /></button></div>)}
+        </div>
+
+        <div className="w-1/2 bg-gray-50 flex flex-col">
+          <div className="p-4 bg-white border-b border-l border-gray-200"><div className="flex items-center justify-between"><div><h2 className="text-lg font-semibold text-gray-800 flex items-center"><FileText className="w-5 h-5 mr-2 text-gray-500" /><span>Extracted Fields</span></h2>{uploadedFile && <p className="text-sm text-gray-500 mt-1 truncate max-w-xs">{uploadedFile.name}</p>}</div><div className="flex items-center space-x-2"><button onClick={() => fileInputRef.current?.click()} className="px-4 py-2 bg-gray-100 text-gray-800 rounded-lg hover:bg-gray-200 flex items-center space-x-2"><Upload className="w-4 h-4" /><span>Change</span></button></div></div></div>
+          <div className="flex-1 overflow-y-auto p-4 space-y-3">
+            {!uploadedFile ? (<div className="flex flex-col items-center justify-center h-full text-center text-gray-500"><FileText className="w-16 h-16 text-gray-300 mb-4" /><h3 className="text-lg font-medium text-gray-700">No Document Uploaded</h3><p>Upload a document to begin validation.</p></div>) 
+            : (
+              <>
+                {extractedFields.map((field) => (
+                  <div key={field.id} className="bg-white rounded-lg border border-gray-200 p-4 transition-all hover:shadow-md">
+                    <div className="flex items-start justify-between mb-2">
+                      <label className="text-sm font-semibold text-gray-800">{field.name}</label>
+                      <div className="flex items-center space-x-2">
+                        <span className={`text-xs font-bold ${getConfidenceColor(field.confidence)}`}>{field.confidence > 0 ? `${field.confidence}%` : 'N/A'}</span>
+                        <button onClick={() => field.value && handleSearch(field.value)} className="p-1 text-gray-400 hover:text-blue-600" title="Find in document"><Eye className="w-4 h-4" /></button>
+                      </div>
+                    </div>
+                    <input type="text" value={field.value} onChange={(e) => handleFieldValueChange(field.id, e.target.value)} className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="Enter value..." />
+                    <div className="flex items-center justify-end mt-3 space-x-2">
+                      <div className={`flex items-center text-xs font-medium transition-opacity ${field.verified ? 'text-green-600 opacity-100' : 'opacity-0'}`}>
+                        <Check className="w-4 h-4 mr-1" /> Verified
+                      </div>
+                      <button onClick={() => handleVerifyField(field.id, true)} className={`px-3 py-1 text-xs rounded-full flex items-center space-x-1.5 transition-colors ${field.verified ? 'bg-green-100 text-green-800' : 'bg-gray-100 text-gray-700 hover:bg-green-100'}`}>
+                        <Check className="w-3.5 h-3.5" />
+                        <span>Approve</span>
+                      </button>
+                      <button onClick={() => handleVerifyField(field.id, false)} className="px-3 py-1 text-xs rounded-full flex items-center space-x-1.5 bg-gray-100 text-gray-700 hover:bg-red-100">
+                        <X className="w-3.5 h-3.5" />
+                        <span>Reject</span>
+                      </button>
+                    </div>
+                  </div>
+                ))}
+                <div className="bg-white rounded-lg border-2 border-dashed border-gray-300 p-4 hover:border-blue-500">
+                  {!isAddingField ? (
+                    <button onClick={() => setIsAddingField(true)} className="w-full flex items-center justify-center space-x-2 text-gray-600 hover:text-blue-600 py-2">
+                      <Plus className="w-5 h-5" />
+                      <span>Add Custom Field</span>
+                    </button>
+                  ) : (
+                    <div className="space-y-3">
+                      <input type="text" value={newFieldName} onChange={(e) => setNewFieldName(e.target.value)} placeholder="Enter new field name..." className="w-full px-3 py-2 border border-gray-300 rounded-md" onKeyPress={(e) => e.key === 'Enter' && addCustomField()} />
+                      <div className="flex space-x-2">
+                        <button onClick={addCustomField} className="bg-blue-600 text-white px-4 py-1.5 rounded-lg text-sm hover:bg-blue-700">Add Field</button>
+                        <button onClick={() => setIsAddingField(false)} className="bg-gray-200 text-gray-800 px-4 py-1.5 rounded-lg text-sm hover:bg-gray-300">Cancel</button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+          {uploadedFile && (
+            <div className="p-4 bg-white border-t border-l border-gray-200">
+              <button className={`w-full px-6 py-3 rounded-lg text-lg font-semibold transition-colors ${verifiedCount === totalFields && totalFields > 0 ? 'bg-green-600 text-white hover:bg-green-700' : 'bg-gray-300 text-gray-500 cursor-not-allowed'}`} disabled={verifiedCount !== totalFields || totalFields === 0}>
+                Complete Validation
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default DocumentValidator;

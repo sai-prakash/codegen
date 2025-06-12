@@ -1,0 +1,1412 @@
+# Figma to React Code Generation - Complete Implementation Guide
+
+## Quick Start Checklist
+
+### Prerequisites
+- [ ] Figma API access token
+- [ ] GPT-4o API endpoint and key
+- [ ] Node.js 18+ installed
+- [ ] GitHub personal access token
+- [ ] Salt Design System documentation
+
+### Environment Setup
+Create `.env` file:
+```bash
+FIGMA_ACCESS_TOKEN=your_figma_token
+LLM_ENDPOINT=your_gpt4o_endpoint
+LLM_API_KEY=your_api_key
+GITHUB_TOKEN=your_github_token
+PORT=3000
+```
+
+## Implementation Phases
+
+### Phase 1: Figma MCP Server Setup (Team Member 1)
+
+#### Step 1.1: Create Project Structure
+```bash
+mkdir figma-to-react-hackathon
+cd figma-to-react-hackathon
+npm init -y
+
+# Install all dependencies
+npm install @modelcontextprotocol/sdk axios dotenv express socket.io cors
+npm install @salt-ds/core @salt-ds/theme @salt-ds/icons
+npm install @octokit/rest multer
+npm install -D typescript @types/node @types/express nodemon
+```
+
+#### Step 1.2: Create Figma MCP Server
+Create `src/figma-mcp/server.ts`:
+
+```typescript
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import axios from 'axios';
+import dotenv from 'dotenv';
+
+dotenv.config();
+
+interface FigmaNode {
+  id: string;
+  name: string;
+  type: string;
+  children?: FigmaNode[];
+  style?: any;
+  fills?: any[];
+  strokes?: any[];
+  effects?: any[];
+  layoutMode?: string;
+  itemSpacing?: number;
+  padding?: any;
+  cornerRadius?: number;
+  characters?: string;
+}
+
+class FigmaMCPServer {
+  private server: Server;
+  private figmaToken: string;
+
+  constructor() {
+    this.server = new Server({
+      name: 'figma-design-extractor',
+      version: '1.0.0',
+    });
+    
+    this.figmaToken = process.env.FIGMA_ACCESS_TOKEN!;
+    this.setupTools();
+  }
+
+  setupTools() {
+    this.server.setRequestHandler('tools/list', async () => ({
+      tools: [
+        {
+          name: 'extract_design',
+          description: 'Extract complete design from Figma URL',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              url: { type: 'string', description: 'Figma file URL' }
+            },
+            required: ['url']
+          }
+        }
+      ]
+    }));
+
+    this.server.setRequestHandler('tools/call', async (request) => {
+      const { name, arguments: args } = request.params;
+      
+      if (name === 'extract_design') {
+        return await this.extractDesign(args.url);
+      }
+      
+      throw new Error(`Unknown tool: ${name}`);
+    });
+  }
+
+  async extractDesign(url: string) {
+    // Parse Figma URL
+    const match = url.match(/figma\.com\/file\/([a-zA-Z0-9]+)/);
+    if (!match) throw new Error('Invalid Figma URL');
+    
+    const fileId = match[1];
+    
+    // Get file data
+    const fileData = await this.getFigmaFile(fileId);
+    const styles = await this.getFileStyles(fileId);
+    
+    // Extract main frame/artboard
+    const mainFrame = this.findMainFrame(fileData.document);
+    const designData = this.parseDesignData(mainFrame, styles);
+    
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify(designData, null, 2)
+      }]
+    };
+  }
+
+  private async getFigmaFile(fileId: string) {
+    const response = await axios.get(
+      `https://api.figma.com/v1/files/${fileId}`,
+      {
+        headers: { 'X-Figma-Token': this.figmaToken }
+      }
+    );
+    return response.data;
+  }
+
+  private async getFileStyles(fileId: string) {
+    const response = await axios.get(
+      `https://api.figma.com/v1/files/${fileId}/styles`,
+      {
+        headers: { 'X-Figma-Token': this.figmaToken }
+      }
+    );
+    return response.data.meta.styles;
+  }
+
+  private findMainFrame(document: any): any {
+    // Find the first frame that looks like a main artboard
+    const findFrame = (node: any): any => {
+      if (node.type === 'FRAME' && node.children?.length > 0) {
+        return node;
+      }
+      if (node.children) {
+        for (const child of node.children) {
+          const found = findFrame(child);
+          if (found) return found;
+        }
+      }
+      return null;
+    };
+    
+    return findFrame(document) || document;
+  }
+
+  private parseDesignData(node: any, styles: any[]): any {
+    return {
+      name: node.name,
+      type: node.type,
+      structure: this.extractStructure(node),
+      styles: this.extractStyles(styles),
+      layout: this.extractLayout(node)
+    };
+  }
+
+  private extractStructure(node: any): any {
+    const structure: any = {
+      id: node.id,
+      name: node.name,
+      type: node.type,
+      visible: node.visible !== false,
+    };
+
+    // Extract component-specific properties
+    if (node.type === 'TEXT') {
+      structure.text = node.characters;
+      structure.style = {
+        fontSize: node.style?.fontSize,
+        fontFamily: node.style?.fontFamily,
+        fontWeight: node.style?.fontWeight,
+        textAlign: node.style?.textAlignHorizontal,
+        color: this.rgbaToHex(node.fills?.[0]?.color)
+      };
+    }
+
+    if (node.fills?.length > 0) {
+      structure.backgroundColor = this.rgbaToHex(node.fills[0].color);
+    }
+
+    if (node.cornerRadius) {
+      structure.borderRadius = node.cornerRadius;
+    }
+
+    if (node.children) {
+      structure.children = node.children.map((child: any) => 
+        this.extractStructure(child)
+      );
+    }
+
+    return structure;
+  }
+
+  private rgbaToHex(color: any): string | null {
+    if (!color) return null;
+    const r = Math.round(color.r * 255);
+    const g = Math.round(color.g * 255);
+    const b = Math.round(color.b * 255);
+    return `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`;
+  }
+
+  private extractStyles(styles: any[]): any {
+    const styleMap: any = {
+      colors: {},
+      typography: {},
+      effects: {}
+    };
+
+    styles.forEach(style => {
+      switch (style.style_type) {
+        case 'FILL':
+          styleMap.colors[style.name] = style.description || style.name;
+          break;
+        case 'TEXT':
+          styleMap.typography[style.name] = style.description || style.name;
+          break;
+        case 'EFFECT':
+          styleMap.effects[style.name] = style.description || style.name;
+          break;
+      }
+    });
+
+    return styleMap;
+  }
+
+  private extractLayout(node: any): any {
+    if (!node.layoutMode) return null;
+    
+    return {
+      mode: node.layoutMode,
+      gap: node.itemSpacing,
+      padding: {
+        top: node.paddingTop || 0,
+        right: node.paddingRight || 0,
+        bottom: node.paddingBottom || 0,
+        left: node.paddingLeft || 0
+      },
+      alignItems: node.primaryAxisAlignItems,
+      justifyContent: node.counterAxisAlignItems
+    };
+  }
+
+  async start() {
+    const transport = new StdioServerTransport();
+    await this.server.connect(transport);
+    console.log('Figma MCP Server started');
+  }
+}
+
+// Start the server
+const server = new FigmaMCPServer();
+server.start().catch(console.error);
+```
+
+### Phase 2: Component Mapping System (Team Member 2)
+
+#### Step 2.1: Create Salt Component Mapper
+Create `src/mappers/salt-mapper.ts`:
+
+```typescript
+export interface SaltComponent {
+  type: string;
+  import: string;
+  props: Record<string, any>;
+  children?: SaltComponent[];
+  content?: string;
+}
+
+export class SaltComponentMapper {
+  private componentMap = {
+    // Core mappings
+    'button': { component: 'Button', import: '@salt-ds/core' },
+    'input': { component: 'Input', import: '@salt-ds/core' },
+    'text': { component: 'Text', import: '@salt-ds/core' },
+    'card': { component: 'Card', import: '@salt-ds/core' },
+    'stack': { component: 'StackLayout', import: '@salt-ds/core' },
+    'flex': { component: 'FlexLayout', import: '@salt-ds/core' },
+    'grid': { component: 'GridLayout', import: '@salt-ds/core' },
+    'switch': { component: 'Switch', import: '@salt-ds/core' },
+    'checkbox': { component: 'Checkbox', import: '@salt-ds/core' },
+    'radio': { component: 'RadioButton', import: '@salt-ds/core' },
+    'select': { component: 'Dropdown', import: '@salt-ds/core' },
+    'dialog': { component: 'Dialog', import: '@salt-ds/core' },
+    'tabs': { component: 'Tabs', import: '@salt-ds/core' },
+  };
+
+  mapFigmaToSalt(figmaData: any): SaltComponent[] {
+    const components: SaltComponent[] = [];
+    this.processNode(figmaData.structure, components);
+    return this.optimizeComponentTree(components);
+  }
+
+  private processNode(node: any, components: SaltComponent[], parent?: SaltComponent): void {
+    const saltComponent = this.detectAndCreateComponent(node);
+    
+    if (saltComponent) {
+      if (parent) {
+        parent.children = parent.children || [];
+        parent.children.push(saltComponent);
+      } else {
+        components.push(saltComponent);
+      }
+      
+      // Process children with new parent
+      if (node.children) {
+        node.children.forEach((child: any) => {
+          this.processNode(child, components, saltComponent);
+        });
+      }
+    } else if (node.children) {
+      // Continue with current parent
+      node.children.forEach((child: any) => {
+        this.processNode(child, components, parent);
+      });
+    }
+  }
+
+  private detectAndCreateComponent(node: any): SaltComponent | null {
+    const componentType = this.detectComponentType(node);
+    if (!componentType) return null;
+
+    const mapping = this.componentMap[componentType];
+    if (!mapping) return null;
+
+    return {
+      type: mapping.component,
+      import: mapping.import,
+      props: this.extractProps(node, componentType),
+      content: node.text || undefined
+    };
+  }
+
+  private detectComponentType(node: any): string | null {
+    const name = node.name.toLowerCase();
+    
+    // Direct name matching
+    for (const [key] of Object.entries(this.componentMap)) {
+      if (name.includes(key)) return key;
+    }
+
+    // Type-based detection
+    switch (node.type) {
+      case 'TEXT':
+        return 'text';
+      case 'FRAME':
+        if (node.layoutMode === 'VERTICAL') return 'stack';
+        if (node.layoutMode === 'HORIZONTAL') return 'flex';
+        if (node.cornerRadius > 0) return 'card';
+        return 'stack'; // default container
+      case 'RECTANGLE':
+        if (name.includes('btn') || name.includes('button')) return 'button';
+        if (node.cornerRadius > 0) return 'card';
+        return null;
+      default:
+        return null;
+    }
+  }
+
+  private extractProps(node: any, componentType: string): Record<string, any> {
+    const props: Record<string, any> = {};
+
+    // Common props
+    if (node.visible === false) props.hidden = true;
+
+    // Component-specific props
+    switch (componentType) {
+      case 'button':
+        props.variant = this.detectVariant(node);
+        props.size = this.detectSize(node);
+        break;
+      
+      case 'input':
+        props.placeholder = this.extractPlaceholder(node);
+        break;
+      
+      case 'stack':
+      case 'flex':
+        if (node.layoutMode) {
+          props.gap = this.mapSpacing(node.itemSpacing || 0);
+          props.align = this.mapAlignment(node.primaryAxisAlignItems);
+        }
+        break;
+      
+      case 'text':
+        if (node.style) {
+          props.styleAs = this.mapTextStyle(node.style);
+          if (node.style.textAlign) {
+            props.align = node.style.textAlign.toLowerCase();
+          }
+        }
+        break;
+      
+      case 'card':
+        props.variant = node.backgroundColor ? 'primary' : 'secondary';
+        break;
+    }
+
+    return props;
+  }
+
+  private detectVariant(node: any): string {
+    const name = node.name.toLowerCase();
+    if (name.includes('primary')) return 'primary';
+    if (name.includes('secondary')) return 'secondary';
+    if (name.includes('ghost')) return 'ghost';
+    
+    // Check by color
+    if (node.backgroundColor) return 'primary';
+    return 'secondary';
+  }
+
+  private detectSize(node: any): string {
+    const height = node.absoluteBoundingBox?.height || 40;
+    if (height < 32) return 'small';
+    if (height > 48) return 'large';
+    return 'medium';
+  }
+
+  private mapSpacing(spacing: number): number {
+    // Salt uses 1-6 scale
+    if (spacing <= 4) return 1;
+    if (spacing <= 8) return 2;
+    if (spacing <= 16) return 3;
+    if (spacing <= 24) return 4;
+    if (spacing <= 32) return 5;
+    return 6;
+  }
+
+  private mapAlignment(align: string): string {
+    const alignMap: Record<string, string> = {
+      'MIN': 'start',
+      'CENTER': 'center',
+      'MAX': 'end',
+    };
+    return alignMap[align] || 'start';
+  }
+
+  private mapTextStyle(style: any): string {
+    const size = style.fontSize || 14;
+    if (size >= 32) return 'h1';
+    if (size >= 24) return 'h2';
+    if (size >= 20) return 'h3';
+    if (size >= 18) return 'h4';
+    return 'body';
+  }
+
+  private extractPlaceholder(node: any): string {
+    // Try to find placeholder text from name or child text
+    const name = node.name.toLowerCase();
+    if (name.includes('email')) return 'Enter email address';
+    if (name.includes('password')) return 'Enter password';
+    if (name.includes('search')) return 'Search...';
+    if (name.includes('name')) return 'Enter your name';
+    
+    // Check for child text node
+    const textChild = node.children?.find((c: any) => c.type === 'TEXT');
+    if (textChild?.text) return textChild.text;
+    
+    return 'Enter text...';
+  }
+
+  private optimizeComponentTree(components: SaltComponent[]): SaltComponent[] {
+    // Remove unnecessary wrappers, merge similar components
+    return components.map(component => {
+      if (component.children && component.children.length === 1) {
+        // Check if we can flatten
+        const child = component.children[0];
+        if (component.type === 'StackLayout' && child.type === 'StackLayout') {
+          // Merge stack layouts
+          return {
+            ...child,
+            props: { ...component.props, ...child.props }
+          };
+        }
+      }
+      
+      if (component.children) {
+        component.children = this.optimizeComponentTree(component.children);
+      }
+      
+      return component;
+    });
+  }
+
+  generateImports(components: SaltComponent[]): string[] {
+    const imports = new Map<string, Set<string>>();
+    
+    const collectImports = (comps: SaltComponent[]) => {
+      comps.forEach(comp => {
+        if (!imports.has(comp.import)) {
+          imports.set(comp.import, new Set());
+        }
+        imports.get(comp.import)!.add(comp.type);
+        
+        if (comp.children) {
+          collectImports(comp.children);
+        }
+      });
+    };
+    
+    collectImports(components);
+    
+    return Array.from(imports.entries()).map(([from, components]) => 
+      `import { ${Array.from(components).join(', ')} } from '${from}';`
+    );
+  }
+}
+```
+
+### Phase 3: LLM Code Generation Service (Team Member 3)
+
+#### Step 3.1: Create LLM Service
+Create `src/services/llm-service.ts`:
+
+```typescript
+import axios from 'axios';
+import { SaltComponent, SaltComponentMapper } from '../mappers/salt-mapper';
+
+export class LLMCodeGenerator {
+  private endpoint: string;
+  private apiKey: string;
+  private mapper: SaltComponentMapper;
+
+  constructor() {
+    this.endpoint = process.env.LLM_ENDPOINT!;
+    this.apiKey = process.env.LLM_API_KEY!;
+    this.mapper = new SaltComponentMapper();
+  }
+
+  async generateReactComponent(figmaData: any): Promise<{
+    code: string;
+    componentName: string;
+    imports: string[];
+    warnings: string[];
+  }> {
+    // 1. Map to Salt components
+    const saltComponents = this.mapper.mapFigmaToSalt(figmaData);
+    const imports = this.mapper.generateImports(saltComponents);
+    
+    // 2. Generate component name
+    const componentName = this.generateComponentName(figmaData.name);
+    
+    // 3. Get examples from QnA
+    const examples = await this.fetchRelevantExamples(saltComponents);
+    
+    // 4. Build prompt
+    const prompt = this.buildPrompt({
+      componentName,
+      figmaData,
+      saltComponents,
+      imports,
+      examples
+    });
+    
+    // 5. Call LLM
+    const code = await this.callLLM(prompt);
+    
+    // 6. Validate
+    const warnings = this.validateCode(code);
+    
+    return {
+      code,
+      componentName,
+      imports,
+      warnings
+    };
+  }
+
+  private generateComponentName(name: string): string {
+    return name
+      .split(/[\s-_]+/)
+      .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+      .join('');
+  }
+
+  private async fetchRelevantExamples(components: SaltComponent[]): Promise<string[]> {
+    const componentTypes = new Set<string>();
+    const collectTypes = (comps: SaltComponent[]) => {
+      comps.forEach(c => {
+        componentTypes.add(c.type);
+        if (c.children) collectTypes(c.children);
+      });
+    };
+    collectTypes(components);
+
+    const examples: string[] = [];
+    
+    for (const type of componentTypes) {
+      try {
+        const response = await axios.post(
+          `${this.endpoint}/qna`,
+          {
+            question: `Show Salt Design System ${type} example with TypeScript`,
+            context: 'salt-design-react'
+          },
+          {
+            headers: {
+              'Authorization': `Bearer ${this.apiKey}`,
+              'Content-Type': 'application/json'
+            }
+          }
+        );
+        
+        if (response.data.answer) {
+          examples.push(response.data.answer);
+        }
+      } catch (error) {
+        console.warn(`Failed to fetch example for ${type}`);
+      }
+    }
+    
+    return examples;
+  }
+
+  private buildPrompt(data: {
+    componentName: string;
+    figmaData: any;
+    saltComponents: SaltComponent[];
+    imports: string[];
+    examples: string[];
+  }): string {
+    const componentTree = this.buildComponentTree(data.saltComponents);
+    
+    return `Create a production-ready React component using Salt Design System.
+
+Component Name: ${data.componentName}
+
+Figma Design Structure:
+${JSON.stringify(data.figmaData, null, 2)}
+
+Required Salt Components:
+${componentTree}
+
+Required Imports:
+${data.imports.join('\n')}
+
+Salt Examples for Reference:
+${data.examples.join('\n\n---\n\n')}
+
+Requirements:
+1. Use TypeScript with proper types
+2. Export as default function component
+3. Use Salt design tokens for spacing/colors
+4. Make responsive using Salt's responsive utilities
+5. Add proper accessibility attributes
+6. Handle all interactive states (hover, focus, active)
+7. Use Salt's built-in validation for forms
+8. Follow React best practices and hooks
+9. Add JSDoc comments for the main component
+
+Generate the complete component file.`;
+  }
+
+  private buildComponentTree(components: SaltComponent[], indent = 0): string {
+    return components.map(comp => {
+      const spaces = '  '.repeat(indent);
+      const propsStr = Object.entries(comp.props)
+        .map(([k, v]) => `${k}={${JSON.stringify(v)}}`)
+        .join(' ');
+      
+      let result = `${spaces}<${comp.type}${propsStr ? ' ' + propsStr : ''}>`;
+      
+      if (comp.content) {
+        result += `\n${spaces}  ${comp.content}`;
+      }
+      
+      if (comp.children && comp.children.length > 0) {
+        result += '\n' + this.buildComponentTree(comp.children, indent + 1);
+      }
+      
+      result += `\n${spaces}</${comp.type}>`;
+      return result;
+    }).join('\n');
+  }
+
+  private async callLLM(prompt: string): Promise<string> {
+    const response = await axios.post(
+      this.endpoint,
+      {
+        model: 'gpt-4',
+        messages: [
+          {
+            role: 'system',
+            content: `You are an expert React developer specializing in Salt Design System. 
+Generate clean, type-safe, production-ready code. Always use function components with TypeScript.`
+          },
+          {
+            role: 'user',
+            content: prompt
+          }
+        ],
+        temperature: 0.3,
+        max_tokens: 4000
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${this.apiKey}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    
+    const content = response.data.choices[0].message.content;
+    
+    // Extract code block
+    const match = content.match(/```(?:tsx?|jsx?)\n([\s\S]*?)\n```/);
+    return match ? match[1] : content;
+  }
+
+  private validateCode(code: string): string[] {
+    const warnings: string[] = [];
+    
+    if (!code.includes('import')) {
+      warnings.push('Missing imports');
+    }
+    
+    if (!code.includes('export default')) {
+      warnings.push('Missing default export');
+    }
+    
+    if (!code.includes(': FC') && !code.includes(': React.FC')) {
+      warnings.push('Consider adding FC type annotation');
+    }
+    
+    if (!code.includes('SaltProvider')) {
+      warnings.push('Components should be wrapped in SaltProvider at app level');
+    }
+    
+    if (!code.includes('aria-') && !code.includes('role=')) {
+      warnings.push('Consider adding accessibility attributes');
+    }
+    
+    return warnings;
+  }
+}
+```
+
+### Phase 4: Main API Server (Team Member 4)
+
+#### Step 4.1: Create Express Server
+Create `src/server.ts`:
+
+```typescript
+import express from 'express';
+import cors from 'cors';
+import { createServer } from 'http';
+import { Server as SocketServer } from 'socket.io';
+import { Octokit } from '@octokit/rest';
+import multer from 'multer';
+import path from 'path';
+import fs from 'fs/promises';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+import dotenv from 'dotenv';
+
+import { LLMCodeGenerator } from './services/llm-service';
+import { FigmaExtractor } from './services/figma-extractor';
+
+dotenv.config();
+
+const execAsync = promisify(exec);
+const upload = multer({ dest: 'uploads/' });
+
+const app = express();
+const server = createServer(app);
+const io = new SocketServer(server, {
+  cors: {
+    origin: '*',
+    methods: ['GET', 'POST']
+  }
+});
+
+const octokit = new Octokit({
+  auth: process.env.GITHUB_TOKEN
+});
+
+app.use(cors());
+app.use(express.json());
+app.use(express.static('public'));
+
+// Services
+const llmGenerator = new LLMCodeGenerator();
+const figmaExtractor = new FigmaExtractor();
+
+// Main endpoint
+app.post('/api/generate', async (req, res) => {
+  const { figmaUrl, targetRepo, targetBranch = 'main' } = req.body;
+  
+  try {
+    // Emit progress updates
+    const emit = (stage: string, data: any) => {
+      io.emit('progress', { stage, data });
+    };
+    
+    emit('start', { message: 'Starting code generation...' });
+    
+    // 1. Extract Figma design
+    emit('figma', { message: 'Extracting Figma design...' });
+    const figmaData = await figmaExtractor.extractFromUrl(figmaUrl);
+    
+    // 2. Generate React code
+    emit('generate', { message: 'Generating React component...' });
+    const { code, componentName, imports, warnings } = 
+      await llmGenerator.generateReactComponent(figmaData);
+    
+    // 3. Create preview
+    emit('preview', { message: 'Creating preview...' });
+    const previewUrl = await createPreview(componentName, code);
+    
+    // 4. Validate code
+    emit('validate', { message: 'Validating code...' });
+    const validation = await validateComponent(componentName, code);
+    
+    // 5. Prepare for GitHub
+    emit('github', { message: 'Preparing GitHub integration...' });
+    const githubData = {
+      path: `src/components/${componentName}.tsx`,
+      content: code,
+      message: `Add ${componentName} component from Figma design`
+    };
+    
+    emit('complete', {
+      message: 'Generation complete!',
+      componentName,
+      previewUrl,
+      validation,
+      warnings,
+      githubData
+    });
+    
+    res.json({
+      success: true,
+      componentName,
+      code,
+      previewUrl,
+      validation,
+      warnings,
+      githubData
+    });
+    
+  } catch (error: any) {
+    console.error('Generation failed:', error);
+    io.emit('error', { message: error.message });
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// GitHub integration endpoint
+app.post('/api/github/push', async (req, res) => {
+  const { owner, repo, path, content, branch = 'main', message } = req.body;
+  
+  try {
+    // Create or update file
+    const response = await octokit.repos.createOrUpdateFileContents({
+      owner,
+      repo,
+      path,
+      message,
+      content: Buffer.from(content).toString('base64'),
+      branch
+    });
+    
+    res.json({
+      success: true,
+      commit: response.data.commit,
+      url: response.data.content?.html_url
+    });
+  } catch (error: any) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Preview generation
+async function createPreview(componentName: string, code: string): Promise<string> {
+  const previewDir = path.join(__dirname, '../previews', componentName);
+  await fs.mkdir(previewDir, { recursive: true });
+  
+  // Save component
+  await fs.writeFile(path.join(previewDir, `${componentName}.tsx`), code);
+  
+  // Create preview app
+  const previewApp = `
+import React from 'react';
+import { createRoot } from 'react-dom/client';
+import { SaltProvider } from '@salt-ds/core';
+import '@salt-ds/theme/index.css';
+import ${componentName} from './${componentName}';
+
+function App() {
+  return (
+    <SaltProvider>
+      <div style={{ padding: '20px' }}>
+        <${componentName} />
+      </div>
+    </SaltProvider>
+  );
+}
+
+const root = createRoot(document.getElementById('root')!);
+root.render(<App />);
+`;
+  
+  await fs.writeFile(path.join(previewDir, 'index.tsx'), previewApp);
+  
+  // Create simple HTML
+  const html = `
+<!DOCTYPE html>
+<html>
+<head>
+  <title>${componentName} Preview</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body>
+  <div id="root"></div>
+  <script src="./bundle.js"></script>
+</body>
+</html>
+`;
+  
+  await fs.writeFile(path.join(previewDir, 'index.html'), html);
+  
+  // Bundle with esbuild (fast for hackathon)
+  await execAsync(
+    `npx esbuild ${previewDir}/index.tsx --bundle --outfile=${previewDir}/bundle.js --platform=browser --loader:.tsx=tsx`
+  );
+  
+  return `/previews/${componentName}/index.html`;
+}
+
+// Component validation
+async function validateComponent(componentName: string, code: string): Promise<{
+  valid: boolean;
+  errors: string[];
+  typecheck: boolean;
+}> {
+  const tempDir = path.join(__dirname, '../temp', componentName);
+  await fs.mkdir(tempDir, { recursive: true });
+  
+  try {
+    // Save component for validation
+    await fs.writeFile(path.join(tempDir, `${componentName}.tsx`), code);
+    
+    // Run TypeScript check
+    const { stdout, stderr } = await execAsync(
+      `npx tsc ${tempDir}/${componentName}.tsx --noEmit --jsx react --esModuleInterop --skipLibCheck`
+    );
+    
+    const errors: string[] = [];
+    if (stderr) {
+      errors.push(...stderr.split('\n').filter(line => line.trim()));
+    }
+    
+    return {
+      valid: errors.length === 0,
+      errors,
+      typecheck: !stderr
+    };
+  } catch (error: any) {
+    return {
+      valid: false,
+      errors: [error.message],
+      typecheck: false
+    };
+  } finally {
+    // Cleanup
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+// Socket connection handling
+io.on('connection', (socket) => {
+  console.log('Client connected:', socket.id);
+  
+  socket.on('disconnect', () => {
+    console.log('Client disconnected:', socket.id);
+  });
+});
+
+// Error handling
+app.use((err: any, req: any, res: any, next: any) => {
+  console.error(err.stack);
+  res.status(500).json({
+    success: false,
+    error: 'Internal server error'
+  });
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
+```
+
+#### Step 4.2: Create Figma Extractor Service
+Create `src/services/figma-extractor.ts`:
+
+```typescript
+import { exec } from 'child_process';
+import { promisify } from 'util';
+import path from 'path';
+
+const execAsync = promisify(exec);
+
+export class FigmaExtractor {
+  async extractFromUrl(figmaUrl: string): Promise<any> {
+    // Use the MCP server to extract design
+    const command = `node ${path.join(__dirname, '../figma-mcp/server.js')}`;
+    
+    const { stdout } = await execAsync(command, {
+      env: {
+        ...process.env,
+        FIGMA_URL: figmaUrl
+      }
+    });
+    
+    return JSON.parse(stdout);
+  }
+}
+```
+
+### Phase 5: Frontend UI (Quick Implementation)
+
+#### Step 5.1: Create Simple Web Interface
+Create `public/index.html`:
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Figma to React - Hackathon Demo</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="/socket.io/socket.io.js"></script>
+</head>
+<body class="bg-gray-50">
+  <div class="container mx-auto p-8 max-w-4xl">
+    <h1 class="text-3xl font-bold text-center mb-8">
+      Figma to React Code Generator
+    </h1>
+    
+    <div class="bg-white rounded-lg shadow-lg p-6">
+      <form id="generateForm" class="space-y-4">
+        <div>
+          <label class="block text-sm font-medium mb-2">
+            Figma Design URL
+          </label>
+          <input
+            type="url"
+            id="figmaUrl"
+            class="w-full p-2 border rounded focus:ring-2 focus:ring-blue-500"
+            placeholder="https://www.figma.com/file/..."
+            required
+          />
+        </div>
+        
+        <div>
+          <label class="block text-sm font-medium mb-2">
+            GitHub Repository (optional)
+          </label>
+          <input
+            type="text"
+            id="githubRepo"
+            class="w-full p-2 border rounded"
+            placeholder="username/repo"
+          />
+        </div>
+        
+        <button
+          type="submit"
+          class="w-full bg-blue-600 text-white py-2 rounded hover:bg-blue-700 transition"
+        >
+          Generate React Component
+        </button>
+      </form>
+      
+      <!-- Progress indicator -->
+      <div id="progress" class="mt-6 hidden">
+        <h3 class="font-semibold mb-2">Progress:</h3>
+        <div class="space-y-2" id="progressSteps"></div>
+      </div>
+      
+      <!-- Results -->
+      <div id="results" class="mt-6 hidden">
+        <h3 class="font-semibold mb-4">Generated Component:</h3>
+        
+        <div class="mb-4">
+          <h4 class="font-medium mb-2">Component Name:</h4>
+          <p id="componentName" class="text-lg text-blue-600"></p>
+        </div>
+        
+        <div class="mb-4">
+          <h4 class="font-medium mb-2">Preview:</h4>
+          <a
+            id="previewLink"
+            href="#"
+            target="_blank"
+            class="text-blue-600 hover:underline"
+          >
+            Open Preview
+          </a>
+        </div>
+        
+        <div class="mb-4">
+          <h4 class="font-medium mb-2">Validation:</h4>
+          <div id="validation" class="text-sm"></div>
+        </div>
+        
+        <div class="mb-4">
+          <h4 class="font-medium mb-2">Generated Code:</h4>
+          <pre id="codePreview" class="bg-gray-100 p-4 rounded overflow-x-auto text-sm"></pre>
+        </div>
+        
+        <div class="flex gap-4">
+          <button
+            id="copyCode"
+            class="bg-green-600 text-white px-4 py-2 rounded hover:bg-green-700"
+          >
+            Copy Code
+          </button>
+          
+          <button
+            id="pushToGithub"
+            class="bg-gray-800 text-white px-4 py-2 rounded hover:bg-gray-900"
+          >
+            Push to GitHub
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+  
+  <script src="/app.js"></script>
+</body>
+</html>
+```
+
+#### Step 5.2: Create Frontend JavaScript
+Create `public/app.js`:
+
+```javascript
+const socket = io();
+const form = document.getElementById('generateForm');
+const progressDiv = document.getElementById('progress');
+const progressSteps = document.getElementById('progressSteps');
+const resultsDiv = document.getElementById('results');
+
+let currentResult = null;
+
+// Socket event handlers
+socket.on('progress', (data) => {
+  progressDiv.classList.remove('hidden');
+  
+  const step = document.createElement('div');
+  step.className = 'flex items-center space-x-2';
+  step.innerHTML = `
+    <svg class="w-5 h-5 text-green-500" fill="currentColor" viewBox="0 0 20 20">
+      <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd"></path>
+    </svg>
+    <span>${data.data.message}</span>
+  `;
+  progressSteps.appendChild(step);
+});
+
+socket.on('complete', (data) => {
+  displayResults(data.data);
+});
+
+socket.on('error', (data) => {
+  alert('Error: ' + data.message);
+  progressDiv.classList.add('hidden');
+});
+
+// Form submission
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  
+  const figmaUrl = document.getElementById('figmaUrl').value;
+  const githubRepo = document.getElementById('githubRepo').value;
+  
+  // Reset UI
+  progressDiv.classList.remove('hidden');
+  progressSteps.innerHTML = '';
+  resultsDiv.classList.add('hidden');
+  
+  try {
+    const response = await fetch('/api/generate', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        figmaUrl,
+        targetRepo: githubRepo
+      })
+    });
+    
+    const result = await response.json();
+    
+    if (result.success) {
+      currentResult = result;
+      displayResults(result);
+    } else {
+      alert('Generation failed: ' + result.error);
+    }
+  } catch (error) {
+    alert('Error: ' + error.message);
+  }
+});
+
+function displayResults(result) {
+  resultsDiv.classList.remove('hidden');
+  
+  document.getElementById('componentName').textContent = result.componentName;
+  document.getElementById('previewLink').href = result.previewUrl;
+  
+  // Display validation
+  const validationDiv = document.getElementById('validation');
+  if (result.validation.valid) {
+    validationDiv.innerHTML = '<span class="text-green-600">✓ Valid TypeScript</span>';
+  } else {
+    validationDiv.innerHTML = `
+      <span class="text-red-600">✗ Validation errors:</span>
+      <ul class="list-disc list-inside mt-1">
+        ${result.validation.errors.map(e => `<li>${e}</li>`).join('')}
+      </ul>
+    `;
+  }
+  
+  // Display warnings
+  if (result.warnings.length > 0) {
+    validationDiv.innerHTML += `
+      <div class="mt-2 text-yellow-600">
+        Warnings:
+        <ul class="list-disc list-inside">
+          ${result.warnings.map(w => `<li>${w}</li>`).join('')}
+        </ul>
+      </div>
+    `;
+  }
+  
+  // Display code
+  document.getElementById('codePreview').textContent = result.code;
+}
+
+// Copy code button
+document.getElementById('copyCode').addEventListener('click', () => {
+  if (currentResult) {
+    navigator.clipboard.writeText(currentResult.code);
+    alert('Code copied to clipboard!');
+  }
+});
+
+// Push to GitHub button
+document.getElementById('pushToGithub').addEventListener('click', async () => {
+  if (!currentResult) return;
+  
+  const githubRepo = document.getElementById('githubRepo').value;
+  if (!githubRepo) {
+    alert('Please enter a GitHub repository');
+    return;
+  }
+  
+  const [owner, repo] = githubRepo.split('/');
+  
+  try {
+    const response = await fetch('/api/github/push', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        owner,
+        repo,
+        path: currentResult.githubData.path,
+        content: currentResult.code,
+        message: currentResult.githubData.message
+      })
+    });
+    
+    const result = await response.json();
+    
+    if (result.success) {
+      alert('Successfully pushed to GitHub!');
+      window.open(result.url, '_blank');
+    } else {
+      alert('GitHub push failed: ' + result.error);
+    }
+  } catch (error) {
+    alert('Error: ' + error.message);
+  }
+});
+```
+
+## Testing & Demo Flow
+
+### 1. Setup Test Environment
+```bash
+# Install all dependencies
+npm install
+
+# Create .env file with your credentials
+cp .env.example .env
+
+# Start the server
+npm run dev
+```
+
+### 2. Prepare Demo Figma File
+Create a simple Figma design with:
+- A card component with title and description
+- A button with primary style
+- An input field with placeholder
+- Proper naming for easy detection
+
+### 3. Demo Script
+
+1. **Show Figma Design**
+   - Open your Figma file
+   - Highlight the design structure
+   - Show component naming
+
+2. **Run Generation**
+   - Paste Figma URL into the web interface
+   - Show real-time progress updates
+   - Explain each step as it happens
+
+3. **Review Generated Code**
+   - Show the generated React component
+   - Highlight Salt Design System usage
+   - Show TypeScript types
+   - Point out responsive design
+
+4. **Preview Component**
+   - Open the preview in new tab
+   - Show it matches Figma design
+   - Demonstrate responsiveness
+
+5. **GitHub Integration**
+   - Show pushing to repository
+   - Open the file on GitHub
+   - Show it's ready for production
+
+## Common Issues & Solutions
+
+### Issue 1: Figma API Rate Limiting
+**Solution**: Add retry logic with exponential backoff
+
+### Issue 2: LLM Timeout
+**Solution**: Implement streaming responses and show partial results
+
+### Issue 3: Component Detection Failures
+**Solution**: Add manual override option in UI
+
+### Issue 4: Preview Build Errors
+**Solution**: Pre-install common dependencies, use fallback CDN
+
+## Optimization Tips for Demo
+
+1. **Pre-cache Examples**: Load Salt examples before demo
+2. **Use Mock Data**: Have fallback mock data if services fail
+3. **Simplify for Demo**: Focus on 3-4 component types that work well
+4. **Error Recovery**: Show graceful error handling
+5. **Performance**: Use lightweight bundler (esbuild) for speed
+
+## Presentation Tips
+
+1. **Start with Problem**: Show manual Figma to React conversion pain
+2. **Live Demo**: Keep it simple, use prepared Figma file
+3. **Show Code Quality**: Highlight production-ready aspects
+4. **Emphasize Innovation**: MCP integration, Salt Design System mapping
+5. **Future Vision**: Mention scalability and enterprise use cases
+
+## Success Metrics
+
+- ✅ Converts Figma design to working React code
+- ✅ Uses Salt Design System components correctly
+- ✅ Generates TypeScript with proper types
+- ✅ Creates preview automatically
+- ✅ Integrates with GitHub
+- ✅ Real-time progress updates
+- ✅ Validates generated code
+
+This implementation should give you a working demo within the hackathon timeframe. Focus on getting the core flow working first, then add enhancements as time permits.
